@@ -430,19 +430,20 @@ void fat_ls(const char *path) {
     
     if (!fs->dir_entries[dir_idx].is_dir) {
         printf("%s\n", fs->dir_entries[dir_idx].name);
+        fflush(stdout);
         return;
     }
     
-    // List all entries in this directory
+    // List all entries in this directory - one per line
     for (uint32_t i = 0; i < fs->num_entries; i++) {
         if (fs->dir_entries[i].is_used && 
             fs->dir_entries[i].parent_entry == dir_idx) {
-            printf("%s%s  ", 
+            printf("%s%s\n", 
                    fs->dir_entries[i].name,
                    fs->dir_entries[i].is_dir ? "/" : "");
+            fflush(stdout);  // Flush after each line
         }
     }
-    printf("\n");
 }
 
 void fat_cat(const char *path) {
@@ -557,15 +558,312 @@ int is_shell_builtin(const char *cmd) {
             strcmp(cmd, "history") == 0 || strcmp(cmd, "jobs") == 0 ||
             strcmp(cmd, "ls") == 0 || strcmp(cmd, "cat") == 0 ||
             strcmp(cmd, "mkdir") == 0 || strcmp(cmd, "touch") == 0 ||
-            strcmp(cmd, "pwd") == 0 || strcmp(cmd, "grep") == 0);
+            strcmp(cmd, "pwd") == 0 || strcmp(cmd, "grep") == 0 ||
+            strcmp(cmd, "rm") == 0 || strcmp(cmd, "rmdir") == 0 ||
+            strcmp(cmd, "head") == 0 || strcmp(cmd, "tail") == 0 ||
+            strcmp(cmd, "mv") == 0);
 }
 
-void fat_grep(const char *pattern, const char *filename) {
-    if (!pattern || !filename) {
-        fprintf(stderr, "grep: missing operand\n");
+int fat_mv(const char *source, const char *dest) {
+    if (!source || !dest) {
+        fprintf(stderr, "mv: missing operand\n");
+        return -1;
+    }
+    
+    // Find source entry
+    uint32_t src_idx = fat_resolve_path(source);
+    if (src_idx == (uint32_t)-1) {
+        fprintf(stderr, "mv: cannot stat '%s': No such file or directory\n", source);
+        return -1;
+    }
+    
+    // Cannot move root
+    if (src_idx == 0) {
+        fprintf(stderr, "mv: cannot move root directory\n");
+        return -1;
+    }
+    
+    dir_entry *src_entry = &fs->dir_entries[src_idx];
+    
+    // Parse destination path
+    char *dest_copy = strdup(dest);
+    char *last_slash = strrchr(dest_copy, '/');
+    char *new_name;
+    uint32_t dest_parent_idx;
+    
+    if (!last_slash) {
+        // No slash - destination is in current directory
+        dest_parent_idx = fs->current_dir;
+        new_name = dest_copy;
+    } else {
+        // Has slash - split into parent and name
+        *last_slash = '\0';
+        new_name = last_slash + 1;
+        
+        if (strlen(dest_copy) == 0) {
+            // Destination is root
+            dest_parent_idx = 0;
+        } else {
+            dest_parent_idx = fat_resolve_path(dest_copy);
+            if (dest_parent_idx == (uint32_t)-1) {
+                fprintf(stderr, "mv: cannot move '%s' to '%s': No such directory\n", source, dest);
+                free(dest_copy);
+                return -1;
+            }
+        }
+    }
+    
+    // Check if destination parent is a directory
+    if (!fs->dir_entries[dest_parent_idx].is_dir) {
+        fprintf(stderr, "mv: cannot move to '%s': Not a directory\n", dest);
+        free(dest_copy);
+        return -1;
+    }
+    
+    // Check if destination already exists
+    uint32_t existing = fat_find_entry(new_name, dest_parent_idx);
+    if (existing != (uint32_t)-1) {
+        // If destination exists and is a directory, move source into it
+        if (fs->dir_entries[existing].is_dir) {
+            dest_parent_idx = existing;
+            new_name = src_entry->name;
+            
+            // Check again if it exists in the destination directory
+            uint32_t existing2 = fat_find_entry(new_name, dest_parent_idx);
+            if (existing2 != (uint32_t)-1) {
+                fprintf(stderr, "mv: cannot move '%s' to '%s': File exists\n", source, dest);
+                free(dest_copy);
+                return -1;
+            }
+        } else {
+            fprintf(stderr, "mv: cannot move '%s' to '%s': File exists\n", source, dest);
+            free(dest_copy);
+            return -1;
+        }
+    }
+    
+    // Perform the move - update parent and name
+    src_entry->parent_entry = dest_parent_idx;
+    strncpy(src_entry->name, new_name, MAX_FILENAME);
+    src_entry->modified = time(NULL);
+    
+    // Try to move real file/directory if it exists
+    char real_src[PATH_MAX], real_dest[PATH_MAX];
+    snprintf(real_src, sizeof(real_src), "%s/%s", ROOT_PATH, source);
+    snprintf(real_dest, sizeof(real_dest), "%s/%s", ROOT_PATH, dest);
+    rename(real_src, real_dest);  // Ignore errors if files don't exist
+    
+    printf("Moved '%s' to '%s'\n", source, dest);
+    free(dest_copy);
+    
+    return 0;
+}
+
+void fat_head(int num_lines, const char *filename) {
+    if (!filename) {
+        fprintf(stderr, "head: missing file operand\n");
         return;
     }
     
+    uint32_t entry_idx = fat_resolve_path(filename);
+    if (entry_idx == (uint32_t)-1) {
+        fprintf(stderr, "head: %s: No such file\n", filename);
+        return;
+    }
+    
+    if (fs->dir_entries[entry_idx].is_dir) {
+        fprintf(stderr, "head: %s: Is a directory\n", filename);
+        return;
+    }
+    
+    char *content = fat_read_file(entry_idx);
+    if (!content) return;
+    
+    // Split into lines and print first N
+    char *content_copy = strdup(content);
+    char *line = strtok(content_copy, "\n");
+    int count = 0;
+    
+    while (line && count < num_lines) {
+        printf("%s\n", line);
+        count++;
+        line = strtok(NULL, "\n");
+    }
+    
+    free(content_copy);
+    free(content);
+}
+
+void fat_tail(int num_lines, const char *filename) {
+    if (!filename) {
+        fprintf(stderr, "tail: missing file operand\n");
+        return;
+    }
+    
+    uint32_t entry_idx = fat_resolve_path(filename);
+    if (entry_idx == (uint32_t)-1) {
+        fprintf(stderr, "tail: %s: No such file\n", filename);
+        return;
+    }
+    
+    if (fs->dir_entries[entry_idx].is_dir) {
+        fprintf(stderr, "tail: %s: Is a directory\n", filename);
+        return;
+    }
+    
+    char *content = fat_read_file(entry_idx);
+    if (!content) return;
+    
+    // Count total lines first
+    char *content_copy1 = strdup(content);
+    char *line = strtok(content_copy1, "\n");
+    int total_lines = 0;
+    while (line) {
+        total_lines++;
+        line = strtok(NULL, "\n");
+    }
+    free(content_copy1);
+    
+    // Calculate starting line
+    int start_line = (total_lines > num_lines) ? (total_lines - num_lines) : 0;
+    
+    // Print from start_line to end
+    char *content_copy2 = strdup(content);
+    line = strtok(content_copy2, "\n");
+    int count = 0;
+    
+    while (line) {
+        if (count >= start_line) {
+            printf("%s\n", line);
+        }
+        count++;
+        line = strtok(NULL, "\n");
+    }
+    
+    free(content_copy2);
+    free(content);
+}
+
+int fat_rmdir(const char *path) {
+    if (!path) {
+        fprintf(stderr, "rmdir: missing operand\n");
+        return -1;
+    }
+    
+    uint32_t entry_idx = fat_resolve_path(path);
+    if (entry_idx == (uint32_t)-1) {
+        fprintf(stderr, "rmdir: failed to remove '%s': No such file or directory\n", path);
+        return -1;
+    }
+    
+    dir_entry *entry = &fs->dir_entries[entry_idx];
+    
+    // Must be a directory
+    if (!entry->is_dir) {
+        fprintf(stderr, "rmdir: failed to remove '%s': Not a directory\n", path);
+        return -1;
+    }
+    
+    // Cannot remove root directory
+    if (entry_idx == 0) {
+        fprintf(stderr, "rmdir: failed to remove '/': Cannot remove root directory\n");
+        return -1;
+    }
+    
+    // Check if directory is empty (no children)
+    for (uint32_t i = 0; i < fs->num_entries; i++) {
+        if (fs->dir_entries[i].is_used && 
+            fs->dir_entries[i].parent_entry == entry_idx) {
+            fprintf(stderr, "rmdir: failed to remove '%s': Directory not empty\n", path);
+            return -1;
+        }
+    }
+    
+    // Cannot remove current directory
+    if (entry_idx == fs->current_dir) {
+        fprintf(stderr, "rmdir: failed to remove '%s': Cannot remove current directory\n", path);
+        return -1;
+    }
+    
+    // Mark entry as unused
+    entry->is_used = 0;
+    
+    // Try to remove real directory if it exists
+    char realdir[PATH_MAX];
+    snprintf(realdir, sizeof(realdir), "%s/%s", ROOT_PATH, path);
+    rmdir(realdir);  // Ignore errors if directory doesn't exist
+    
+    printf("Removed directory '%s' from virtual file system\n", path);
+    
+    return 0;
+}
+
+int fat_rm(const char *path) {
+    if (!path) {
+        fprintf(stderr, "rm: missing operand\n");
+        return -1;
+    }
+    
+    uint32_t entry_idx = fat_resolve_path(path);
+    if (entry_idx == (uint32_t)-1) {
+        fprintf(stderr, "rm: cannot remove '%s': No such file or directory\n", path);
+        return -1;
+    }
+    
+    dir_entry *entry = &fs->dir_entries[entry_idx];
+    
+    // Don't allow removing directories (use rmdir for that)
+    if (entry->is_dir) {
+        fprintf(stderr, "rm: cannot remove '%s': Is a directory\n", path);
+        return -1;
+    }
+    
+    // Free the blocks used by this file
+    if (entry->first_block != FAT_EOC) {
+        fat_free_chain(entry->first_block);
+    }
+    
+    // Mark entry as unused
+    entry->is_used = 0;
+    entry->first_block = FAT_EOC;
+    entry->size = 0;
+    
+    // Try to remove the real file too (if it exists)
+    char realfile[PATH_MAX];
+    snprintf(realfile, sizeof(realfile), "%s/%s", ROOT_PATH, path);
+    unlink(realfile);  // Ignore errors if file doesn't exist
+    
+    printf("Removed '%s' from virtual file system\n", path);
+    
+    return 0;
+}
+
+void fat_grep(const char *pattern, const char *filename) {
+    if (!pattern) {
+        fprintf(stderr, "grep: missing pattern\n");
+        return;
+    }
+    
+    // If reading from stdin (no filename or filename is "-")
+    if (!filename || strcmp(filename, "-") == 0) {
+        char line[1024];
+        while (fgets(line, sizeof(line), stdin)) {
+            // Remove trailing newline if present
+            size_t len = strlen(line);
+            if (len > 0 && line[len-1] == '\n') {
+                line[len-1] = '\0';
+            }
+            
+            // Only print if pattern is found
+            if (strstr(line, pattern) != NULL) {
+                printf("%s\n", line);
+                fflush(stdout);
+            }
+        }
+        return;
+    }
+    
+    // Reading from a file
     uint32_t entry_idx = fat_resolve_path(filename);
     if (entry_idx == (uint32_t)-1) {
         fprintf(stderr, "grep: %s: No such file\n", filename);
@@ -580,15 +878,17 @@ void fat_grep(const char *pattern, const char *filename) {
     char *content = fat_read_file(entry_idx);
     if (!content) return;
     
-    // Simple line-by-line grep
-    char *line = strtok(content, "\n");
+    // Make a copy since strtok modifies the string
+    char *content_copy = strdup(content);
+    char *line = strtok(content_copy, "\n");
     while (line) {
-        if (strstr(line, pattern)) {
+        if (strstr(line, pattern) != NULL) {
             printf("%s\n", line);
         }
         line = strtok(NULL, "\n");
     }
     
+    free(content_copy);
     free(content);
 }
 
@@ -616,11 +916,13 @@ int do_shell_builtin(int argc, char **argv) {
         return 0;
     }
     else if (strcmp(argv[0], "grep") == 0) {
-        if (argc < 3) {
-            fprintf(stderr, "grep: usage: grep pattern file\n");
+        if (argc < 2) {
+            fprintf(stderr, "grep: usage: grep pattern [file]\n");
             return -1;
         }
-        fat_grep(argv[1], argv[2]);
+        // grep pattern [file]
+        // If no file, read from stdin
+        fat_grep(argv[1], argc > 2 ? argv[2] : NULL);
         return 0;
     }
     else if (strcmp(argv[0], "mkdir") == 0) {
@@ -643,6 +945,105 @@ int do_shell_builtin(int argc, char **argv) {
             perror("touch");
             return -1;
         }
+        return 0;
+    }
+    else if (strcmp(argv[0], "rm") == 0) {
+        if (argc < 2) {
+            fprintf(stderr, "rm: missing operand\n");
+            return -1;
+        }
+        if (fat_rm(argv[1]) < 0) {
+            return -1;
+        }
+        // Auto-save after removing
+        char imgpath[PATH_MAX];
+        snprintf(imgpath, sizeof(imgpath), "%s/mysh_fs.img", ROOT_PATH);
+        fat_save_image(imgpath);
+        return 0;
+    }
+    else if (strcmp(argv[0], "rmdir") == 0) {
+        if (argc < 2) {
+            fprintf(stderr, "rmdir: missing operand\n");
+            return -1;
+        }
+        if (fat_rmdir(argv[1]) < 0) {
+            return -1;
+        }
+        // Auto-save after removing directory
+        char imgpath[PATH_MAX];
+        snprintf(imgpath, sizeof(imgpath), "%s/mysh_fs.img", ROOT_PATH);
+        fat_save_image(imgpath);
+        return 0;
+    }
+    else if (strcmp(argv[0], "head") == 0) {
+        int num_lines = 10;  // Default: 10 lines
+        const char *filename = NULL;
+        
+        // Parse arguments: head [-n NUM] FILE
+        if (argc < 2) {
+            fprintf(stderr, "head: missing file operand\n");
+            return -1;
+        }
+        
+        if (argc == 2) {
+            // head FILE
+            filename = argv[1];
+        } else if (argc == 4 && strcmp(argv[1], "-n") == 0) {
+            // head -n NUM FILE
+            num_lines = atoi(argv[2]);
+            filename = argv[3];
+        } else if (argc == 3 && argv[1][0] == '-' && isdigit(argv[1][1])) {
+            // head -NUM FILE
+            num_lines = atoi(argv[1] + 1);
+            filename = argv[2];
+        } else {
+            filename = argv[1];
+        }
+        
+        fat_head(num_lines, filename);
+        return 0;
+    }
+    else if (strcmp(argv[0], "tail") == 0) {
+        int num_lines = 10;  // Default: 10 lines
+        const char *filename = NULL;
+        
+        // Parse arguments: tail [-n NUM] FILE
+        if (argc < 2) {
+            fprintf(stderr, "tail: missing file operand\n");
+            return -1;
+        }
+        
+        if (argc == 2) {
+            // tail FILE
+            filename = argv[1];
+        } else if (argc == 4 && strcmp(argv[1], "-n") == 0) {
+            // tail -n NUM FILE
+            num_lines = atoi(argv[2]);
+            filename = argv[3];
+        } else if (argc == 3 && argv[1][0] == '-' && isdigit(argv[1][1])) {
+            // tail -NUM FILE
+            num_lines = atoi(argv[1] + 1);
+            filename = argv[2];
+        } else {
+            filename = argv[1];
+        }
+        
+        fat_tail(num_lines, filename);
+        return 0;
+    }
+    else if (strcmp(argv[0], "mv") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "mv: missing operand\n");
+            fprintf(stderr, "Usage: mv SOURCE DEST\n");
+            return -1;
+        }
+        if (fat_mv(argv[1], argv[2]) < 0) {
+            return -1;
+        }
+        // Auto-save after moving
+        char imgpath[PATH_MAX];
+        snprintf(imgpath, sizeof(imgpath), "%s/mysh_fs.img", ROOT_PATH);
+        fat_save_image(imgpath);
         return 0;
     }
     else if (strcmp(argv[0], "pwd") == 0) {
@@ -675,25 +1076,60 @@ typedef struct {
 
 int parse_pipeline(char *line, command *cmds, int *num_cmds) {
     *num_cmds = 0;
-    char *cmd_str = strtok(line, "|");
+    
+    // Check if there's a pipe at all
+    if (!strchr(line, '|')) {
+        // No pipe - single command
+        cmds[0].argc = 0;
+        char *tok = strtok(line, " \t");
+        while (tok && cmds[0].argc < 63) {
+            cmds[0].argv[cmds[0].argc++] = strdup(tok);
+            tok = strtok(NULL, " \t");
+        }
+        cmds[0].argv[cmds[0].argc] = NULL;
+        *num_cmds = (cmds[0].argc > 0) ? 1 : 0;
+        return *num_cmds;
+    }
+    
+    // Parse pipeline - split by pipe first
+    char *saveptr1;
+    char *cmd_str = strtok_r(line, "|", &saveptr1);
     
     while (cmd_str && *num_cmds < 10) {
         // Trim leading spaces
-        while (*cmd_str == ' ') cmd_str++;
+        while (*cmd_str == ' ' || *cmd_str == '\t') cmd_str++;
+        
+        // Trim trailing spaces
+        char *end = cmd_str + strlen(cmd_str) - 1;
+        while (end > cmd_str && (*end == ' ' || *end == '\t')) {
+            *end = '\0';
+            end--;
+        }
+        
+        if (strlen(cmd_str) == 0) {
+            cmd_str = strtok_r(NULL, "|", &saveptr1);
+            continue;
+        }
         
         cmds[*num_cmds].argc = 0;
-        char *tok = strtok(cmd_str, " ");
+        
+        // Parse this command's arguments using a separate copy
+        char *cmd_copy = strdup(cmd_str);
+        char *saveptr2;
+        char *tok = strtok_r(cmd_copy, " \t", &saveptr2);
+        
         while (tok && cmds[*num_cmds].argc < 63) {
-            cmds[*num_cmds].argv[cmds[*num_cmds].argc++] = tok;
-            tok = strtok(NULL, " ");
+            cmds[*num_cmds].argv[cmds[*num_cmds].argc++] = strdup(tok);
+            tok = strtok_r(NULL, " \t", &saveptr2);
         }
         cmds[*num_cmds].argv[cmds[*num_cmds].argc] = NULL;
+        free(cmd_copy);
         
         if (cmds[*num_cmds].argc > 0) {
             (*num_cmds)++;
         }
         
-        cmd_str = strtok(NULL, "|");
+        cmd_str = strtok_r(NULL, "|", &saveptr1);
     }
     
     return *num_cmds;
@@ -749,21 +1185,30 @@ int execute_pipeline(command *cmds, int num_cmds) {
         }
     }
     
+    pid_t pids[10];
+    
     for (int i = 0; i < num_cmds; i++) {
         pid_t pid = fork();
+        pids[i] = pid;
         
         if (pid == 0) {
             // Not first command: read from previous pipe
             if (i > 0) {
-                dup2(pipefds[(i - 1) * 2], STDIN_FILENO);
+                if (dup2(pipefds[(i - 1) * 2], STDIN_FILENO) < 0) {
+                    perror("dup2 stdin");
+                    exit(1);
+                }
             }
             
             // Not last command: write to next pipe
             if (i < num_cmds - 1) {
-                dup2(pipefds[i * 2 + 1], STDOUT_FILENO);
+                if (dup2(pipefds[i * 2 + 1], STDOUT_FILENO) < 0) {
+                    perror("dup2 stdout");
+                    exit(1);
+                }
             }
             
-            // Close all pipe fds
+            // Close all pipe fds in child
             for (int j = 0; j < 2 * (num_cmds - 1); j++) {
                 close(pipefds[j]);
             }
@@ -788,9 +1233,10 @@ int execute_pipeline(command *cmds, int num_cmds) {
         close(pipefds[i]);
     }
     
-    // Wait for all children
+    // Wait for all children in order
     for (int i = 0; i < num_cmds; i++) {
-        wait(NULL);
+        int status;
+        waitpid(pids[i], &status, 0);
     }
     
     return 0;
@@ -830,6 +1276,14 @@ int main() {
         char *line_copy = strdup(line);
         parse_pipeline(line_copy, cmds, &num_cmds);
         execute_pipeline(cmds, num_cmds);
+        
+        // Free strdup'd strings from parsing
+        for (int i = 0; i < num_cmds; i++) {
+            for (int j = 0; j < cmds[i].argc; j++) {
+                free(cmds[i].argv[j]);
+            }
+        }
+        
         free(line_copy);
     }
     
