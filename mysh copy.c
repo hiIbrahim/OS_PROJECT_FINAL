@@ -28,74 +28,6 @@
 char ROOT_PATH[PATH_MAX];
 volatile pid_t fg_pgid = 0;
 
-/* ---------- Command History ---------- */
-#define MAX_HISTORY 1000
-char *command_history[MAX_HISTORY];
-int history_count = 0;
-
-void add_to_history(const char *cmd) {
-    if (!cmd || strlen(cmd) == 0) return;
-    
-    // Don't add duplicate of last command
-    if (history_count > 0 && strcmp(command_history[history_count - 1], cmd) == 0) {
-        return;
-    }
-    
-    if (history_count < MAX_HISTORY) {
-        command_history[history_count++] = strdup(cmd);
-    } else {
-        // Shift history and add new command
-        free(command_history[0]);
-        for (int i = 0; i < MAX_HISTORY - 1; i++) {
-            command_history[i] = command_history[i + 1];
-        }
-        command_history[MAX_HISTORY - 1] = strdup(cmd);
-    }
-}
-
-void print_history() {
-    for (int i = 0; i < history_count; i++) {
-        printf("%5d  %s\n", i + 1, command_history[i]);
-    }
-}
-
-void save_history() {
-    char histfile[PATH_MAX];
-    snprintf(histfile, sizeof(histfile), "%s/.mysh_history", ROOT_PATH);
-    
-    FILE *fp = fopen(histfile, "w");
-    if (!fp) return;
-    
-    for (int i = 0; i < history_count; i++) {
-        fprintf(fp, "%s\n", command_history[i]);
-    }
-    
-    fclose(fp);
-}
-
-void load_history() {
-    char histfile[PATH_MAX];
-    snprintf(histfile, sizeof(histfile), "%s/.mysh_history", ROOT_PATH);
-    
-    FILE *fp = fopen(histfile, "r");
-    if (!fp) return;
-    
-    char line[1024];
-    while (fgets(line, sizeof(line), fp) && history_count < MAX_HISTORY) {
-        // Remove trailing newline
-        size_t len = strlen(line);
-        if (len > 0 && line[len - 1] == '\n') {
-            line[len - 1] = '\0';
-        }
-        
-        if (strlen(line) > 0) {
-            command_history[history_count++] = strdup(line);
-        }
-    }
-    
-    fclose(fp);
-}
-
 /* ---------- FAT Data Structures ---------- */
 typedef struct {
     char name[MAX_FILENAME + 1];
@@ -1123,24 +1055,10 @@ int do_shell_builtin(int argc, char **argv) {
         char imgpath[PATH_MAX];
         snprintf(imgpath, sizeof(imgpath), "%s/mysh_fs.img", ROOT_PATH);
         fat_save_image(imgpath);
-        
-        // Save command history
-        save_history();
-        
         printf("File system saved to mysh_fs.img\n");
         exit(0);
     }
     else if (strcmp(argv[0], "history") == 0) {
-        if (argc > 1 && strcmp(argv[1], "-c") == 0) {
-            // Clear history
-            for (int i = 0; i < history_count; i++) {
-                free(command_history[i]);
-            }
-            history_count = 0;
-            printf("History cleared\n");
-        } else {
-            print_history();
-        }
         return 0;
     }
     else if (strcmp(argv[0], "jobs") == 0) {
@@ -1154,9 +1072,6 @@ int do_shell_builtin(int argc, char **argv) {
 typedef struct {
     char *argv[64];
     int argc;
-    char *input_file;   // For < redirection
-    char *output_file;  // For > redirection
-    int append_mode;    // For >> redirection
 } command;
 
 int parse_pipeline(char *line, command *cmds, int *num_cmds) {
@@ -1164,33 +1079,11 @@ int parse_pipeline(char *line, command *cmds, int *num_cmds) {
     
     // Check if there's a pipe at all
     if (!strchr(line, '|')) {
-        // No pipe - single command, but check for redirection
+        // No pipe - single command
         cmds[0].argc = 0;
-        cmds[0].input_file = NULL;
-        cmds[0].output_file = NULL;
-        cmds[0].append_mode = 0;
-        
         char *tok = strtok(line, " \t");
         while (tok && cmds[0].argc < 63) {
-            // Check for redirection operators
-            if (strcmp(tok, "<") == 0) {
-                tok = strtok(NULL, " \t");
-                if (tok) cmds[0].input_file = strdup(tok);
-            } else if (strcmp(tok, ">") == 0) {
-                tok = strtok(NULL, " \t");
-                if (tok) {
-                    cmds[0].output_file = strdup(tok);
-                    cmds[0].append_mode = 0;
-                }
-            } else if (strcmp(tok, ">>") == 0) {
-                tok = strtok(NULL, " \t");
-                if (tok) {
-                    cmds[0].output_file = strdup(tok);
-                    cmds[0].append_mode = 1;
-                }
-            } else {
-                cmds[0].argv[cmds[0].argc++] = strdup(tok);
-            }
+            cmds[0].argv[cmds[0].argc++] = strdup(tok);
             tok = strtok(NULL, " \t");
         }
         cmds[0].argv[cmds[0].argc] = NULL;
@@ -1219,9 +1112,6 @@ int parse_pipeline(char *line, command *cmds, int *num_cmds) {
         }
         
         cmds[*num_cmds].argc = 0;
-        cmds[*num_cmds].input_file = NULL;
-        cmds[*num_cmds].output_file = NULL;
-        cmds[*num_cmds].append_mode = 0;
         
         // Parse this command's arguments using a separate copy
         char *cmd_copy = strdup(cmd_str);
@@ -1229,25 +1119,7 @@ int parse_pipeline(char *line, command *cmds, int *num_cmds) {
         char *tok = strtok_r(cmd_copy, " \t", &saveptr2);
         
         while (tok && cmds[*num_cmds].argc < 63) {
-            // Check for redirection (only in first/last command of pipeline)
-            if (strcmp(tok, "<") == 0 && *num_cmds == 0) {
-                tok = strtok_r(NULL, " \t", &saveptr2);
-                if (tok) cmds[*num_cmds].input_file = strdup(tok);
-            } else if (strcmp(tok, ">") == 0) {
-                tok = strtok_r(NULL, " \t", &saveptr2);
-                if (tok) {
-                    cmds[*num_cmds].output_file = strdup(tok);
-                    cmds[*num_cmds].append_mode = 0;
-                }
-            } else if (strcmp(tok, ">>") == 0) {
-                tok = strtok_r(NULL, " \t", &saveptr2);
-                if (tok) {
-                    cmds[*num_cmds].output_file = strdup(tok);
-                    cmds[*num_cmds].append_mode = 1;
-                }
-            } else {
-                cmds[*num_cmds].argv[cmds[*num_cmds].argc++] = strdup(tok);
-            }
+            cmds[*num_cmds].argv[cmds[*num_cmds].argc++] = strdup(tok);
             tok = strtok_r(NULL, " \t", &saveptr2);
         }
         cmds[*num_cmds].argv[cmds[*num_cmds].argc] = NULL;
@@ -1269,100 +1141,17 @@ int execute_pipeline(command *cmds, int num_cmds) {
     // Single command (no pipe)
     if (num_cmds == 1) {
         if (is_shell_builtin(cmds[0].argv[0])) {
-            // Handle redirection for builtins
-            int saved_stdin = -1, saved_stdout = -1;
-            int input_fd = -1, output_fd = -1;
-            
-            if (cmds[0].input_file) {
-                char realfile[PATH_MAX];
-                snprintf(realfile, sizeof(realfile), "%s/%s", ROOT_PATH, cmds[0].input_file);
-                input_fd = open(realfile, O_RDONLY);
-                if (input_fd < 0) {
-                    perror(cmds[0].input_file);
-                    return -1;
-                }
-                saved_stdin = dup(STDIN_FILENO);
-                dup2(input_fd, STDIN_FILENO);
-            }
-            
-            if (cmds[0].output_file) {
-                char realfile[PATH_MAX];
-                snprintf(realfile, sizeof(realfile), "%s/%s", ROOT_PATH, cmds[0].output_file);
-                int flags = O_WRONLY | O_CREAT | (cmds[0].append_mode ? O_APPEND : O_TRUNC);
-                output_fd = open(realfile, flags, 0644);
-                if (output_fd < 0) {
-                    perror(cmds[0].output_file);
-                    if (input_fd >= 0) {
-                        close(input_fd);
-                        dup2(saved_stdin, STDIN_FILENO);
-                        close(saved_stdin);
-                    }
-                    return -1;
-                }
-                saved_stdout = dup(STDOUT_FILENO);
-                dup2(output_fd, STDOUT_FILENO);
-            }
-            
-            int result = do_shell_builtin(cmds[0].argc, cmds[0].argv);
-            
-            // Restore stdin/stdout
-            if (saved_stdin >= 0) {
-                dup2(saved_stdin, STDIN_FILENO);
-                close(saved_stdin);
-                close(input_fd);
-            }
-            if (saved_stdout >= 0) {
-                dup2(saved_stdout, STDOUT_FILENO);
-                close(saved_stdout);
-                close(output_fd);
-                
-                // Sync output file to VFS
-                fat_sync_from_real_file(cmds[0].output_file);
-            }
-            
-            return result;
+            return do_shell_builtin(cmds[0].argc, cmds[0].argv);
         }
         
         pid_t pid = fork();
         if (pid == 0) {
-            // Handle input redirection
-            if (cmds[0].input_file) {
-                char realfile[PATH_MAX];
-                snprintf(realfile, sizeof(realfile), "%s/%s", ROOT_PATH, cmds[0].input_file);
-                int fd = open(realfile, O_RDONLY);
-                if (fd < 0) {
-                    perror(cmds[0].input_file);
-                    exit(1);
-                }
-                dup2(fd, STDIN_FILENO);
-                close(fd);
-            }
-            
-            // Handle output redirection
-            if (cmds[0].output_file) {
-                char realfile[PATH_MAX];
-                snprintf(realfile, sizeof(realfile), "%s/%s", ROOT_PATH, cmds[0].output_file);
-                int flags = O_WRONLY | O_CREAT | (cmds[0].append_mode ? O_APPEND : O_TRUNC);
-                int fd = open(realfile, flags, 0644);
-                if (fd < 0) {
-                    perror(cmds[0].output_file);
-                    exit(1);
-                }
-                dup2(fd, STDOUT_FILENO);
-                close(fd);
-            }
-            
             execvp(cmds[0].argv[0], cmds[0].argv);
             fprintf(stderr, "%s: command not found\n", cmds[0].argv[0]);
             exit(127);
         } else if (pid > 0) {
             int status;
             waitpid(pid, &status, 0);
-            
-            // Sync output file to VFS if it was redirected
-            if (cmds[0].output_file) {
-                fat_sync_from_real_file(cmds[0].output_file);
-            }
             
             // Check if editor was used
             int is_editor = (strcmp(cmds[0].argv[0], "nano") == 0 || 
@@ -1403,39 +1192,16 @@ int execute_pipeline(command *cmds, int num_cmds) {
         pids[i] = pid;
         
         if (pid == 0) {
-            // Handle input redirection (first command only)
-            if (i == 0 && cmds[i].input_file) {
-                char realfile[PATH_MAX];
-                snprintf(realfile, sizeof(realfile), "%s/%s", ROOT_PATH, cmds[i].input_file);
-                int fd = open(realfile, O_RDONLY);
-                if (fd < 0) {
-                    perror(cmds[i].input_file);
-                    exit(1);
-                }
-                dup2(fd, STDIN_FILENO);
-                close(fd);
-            } else if (i > 0) {
-                // Not first command: read from previous pipe
+            // Not first command: read from previous pipe
+            if (i > 0) {
                 if (dup2(pipefds[(i - 1) * 2], STDIN_FILENO) < 0) {
                     perror("dup2 stdin");
                     exit(1);
                 }
             }
             
-            // Handle output redirection (last command only)
-            if (i == num_cmds - 1 && cmds[i].output_file) {
-                char realfile[PATH_MAX];
-                snprintf(realfile, sizeof(realfile), "%s/%s", ROOT_PATH, cmds[i].output_file);
-                int flags = O_WRONLY | O_CREAT | (cmds[i].append_mode ? O_APPEND : O_TRUNC);
-                int fd = open(realfile, flags, 0644);
-                if (fd < 0) {
-                    perror(cmds[i].output_file);
-                    exit(1);
-                }
-                dup2(fd, STDOUT_FILENO);
-                close(fd);
-            } else if (i < num_cmds - 1) {
-                // Not last command: write to next pipe
+            // Not last command: write to next pipe
+            if (i < num_cmds - 1) {
                 if (dup2(pipefds[i * 2 + 1], STDOUT_FILENO) < 0) {
                     perror("dup2 stdout");
                     exit(1);
@@ -1473,11 +1239,6 @@ int execute_pipeline(command *cmds, int num_cmds) {
         waitpid(pids[i], &status, 0);
     }
     
-    // Sync output file to VFS if last command had redirection
-    if (num_cmds > 0 && cmds[num_cmds - 1].output_file) {
-        fat_sync_from_real_file(cmds[num_cmds - 1].output_file);
-    }
-    
     return 0;
 }
 
@@ -1488,7 +1249,6 @@ int main() {
     }
     
     fat_init();
-    load_history();  // Load command history on startup
     
     char *line = NULL;
     size_t linecap = 0;
@@ -1502,15 +1262,11 @@ int main() {
         ssize_t nread = getline(&line, &linecap, stdin);
         if (nread <= 0) {
             printf("\n");
-            save_history();  // Save history on EOF
             break;
         }
         
         if (line[nread - 1] == '\n') line[nread - 1] = 0;
         if (strlen(line) == 0) continue;
-        
-        // Add command to history
-        add_to_history(line);
         
         // Parse and execute pipeline
         command cmds[10];
@@ -1526,20 +1282,12 @@ int main() {
             for (int j = 0; j < cmds[i].argc; j++) {
                 free(cmds[i].argv[j]);
             }
-            if (cmds[i].input_file) free(cmds[i].input_file);
-            if (cmds[i].output_file) free(cmds[i].output_file);
         }
         
         free(line_copy);
     }
     
     free(line);
-    
-    // Free history on exit
-    for (int i = 0; i < history_count; i++) {
-        free(command_history[i]);
-    }
-    
     free(fs);
     return 0;
 }
